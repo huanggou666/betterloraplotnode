@@ -10,8 +10,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoRAPlotImageSaver": "LoRA Plot Image Saver"
 }
 
-# Serves everything under ./web/ so the browser can load our custom widget JS
-# (power-lora-loader style rows: per-lora on/off toggle + strength).
-WEB_DIRECTORY = "./web"
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
 
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']

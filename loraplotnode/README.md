@@ -2,25 +2,6 @@
 
 A custom ComfyUI node for testing multiple LoRA models across different strength values. Automatically generates model/clip pairs for each LoRA-strength combination and includes an image saver node with text overlay for easy identification.
 
-## UI (rgthree "Power Lora Loader" style)
-
-The `LoRA Plot Node` widget has been rebuilt to match rgthree-comfy's Power
-Lora Loader row layout 1:1:
-
-- A "Toggle All" header row with a single switch to enable/disable every LoRA.
-- Each LoRA gets its own row: a rounded pill with an on/off toggle on the
-  left, the LoRA name in the middle (click to pick from your `loras` folder),
-  and its own strength value on the right with `◀ value ▶` arrows (click the
-  number to type an exact value, drag left/right to nudge it).
-- A row's strength can be a single number (`1.0`) or a comma-separated list
-  (`0.8,0.9,1.0`) — this keeps the original "plot every strength" behavior,
-  now configurable per LoRA instead of one shared list for every LoRA.
-- Click "➕ Add Lora" to add a row; right-click a row to toggle it, move it
-  up/down, or remove it — same interactions as rgthree's node.
-
-This is a self-contained implementation (no dependency on rgthree-comfy being
-installed) that only borrows the *visual layout*, not any of its code.
-
 ## Features
 
 - Test multiple LoRAs with different strength values in a single workflow

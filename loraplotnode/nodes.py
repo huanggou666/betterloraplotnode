@@ -8,20 +8,29 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch
 
-from .utils import FlexibleOptionalInputType, any_type
+
+# Number of LoRA slots exposed by the node. Each slot has its own
+# (lora, strength, on) widgets so the user can configure every LoRA independently.
+NUM_LORA_SLOTS = 10
+
 
 class LoRAPlotNode:
     """
-    A ComfyUI node that takes multiple LoRAs and strength values,
-    applies each combination to the base model/clip, and outputs
-    multiple model/clip pairs for downstream processing.
+    A ComfyUI node that takes multiple LoRAs (each with its own weight and on/off toggle),
+    applies each enabled LoRA to the base model/clip, and outputs multiple model/clip pairs
+    for downstream processing (e.g. comparison grids via LoRAPlotImageSaver).
 
-    The UI is a dynamic, rgthree "Power Lora Loader" style list: each row has
-    its own on/off toggle, its own LoRA picker, and its own strength value(s)
-    (a single float, or a comma-separated list of floats to keep the original
-    "plot every strength" behavior on a per-LoRA basis). Rows are added with
-    the "+ Add Lora" button and can be reordered / removed / toggled via
-    right-click, exactly like rgthree-comfy's node.
+    Layout follows the rgthree Power Lora Loader idea — per-LoRA on/off and per-LoRA
+    weight — but expressed with the default ComfyUI widgets (no custom JS required), so
+    every slot works out of the box. Each of the NUM_LORA_SLOTS slots has three widgets:
+      - lora_N     (COMBO):   the LoRA file ("None" skips this slot)
+      - strength_N (FLOAT):   the strength applied to this slot
+      - on_N       (BOOLEAN): enable/disable this slot
+
+    The original "plot" behavior is preserved: each enabled slot produces its own
+    (model, clip, metadata) output, so the downstream image saver can render a comparison
+    grid. Strengths are no longer shared via a comma-separated string — every LoRA row has
+    its own weight, and disabled rows are skipped entirely.
     """
     # Class-level cache for LoRA dictionaries to avoid reloading
     _lora_cache = {}
@@ -29,17 +38,34 @@ class LoRAPlotNode:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Get list of available LoRAs
+        loras = folder_paths.get_filename_list("loras")
+        # Add "None" option to the beginning
+        lora_selections = ["None"] + loras
+
+        optional = {}
+        for i in range(1, NUM_LORA_SLOTS + 1):
+            optional[f"lora_{i}"] = (lora_selections, {"default": "None"})
+            optional[f"strength_{i}"] = ("FLOAT", {
+                "default": 1.0,
+                "min": -10.0,
+                "max": 10.0,
+                "step": 0.05,
+                "round": 0.001,
+                "display": "number",
+            })
+            optional[f"on_{i}"] = ("BOOLEAN", {
+                "default": True,
+                "label_on": "on",
+                "label_off": "off",
+            })
+
         return {
             "required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
             },
-            # The UI adds a dynamic number of "lora_N" rows (each an object:
-            # {on, lora, strengths}). FlexibleOptionalInputType lets ComfyUI
-            # accept however many of these the user has added in the widget,
-            # without us having to declare a fixed number of slots.
-            "optional": FlexibleOptionalInputType(type=any_type),
-            "hidden": {},
+            "optional": optional,
         }
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING")
@@ -50,39 +76,31 @@ class LoRAPlotNode:
 
     def apply_loras(self, model, clip, **kwargs):
         """
-        Apply multiple LoRAs, each with its own on/off toggle and its own
-        strength value(s), producing one model/clip output per (lora, strength)
-        combination (a LoRA can plot several strengths by giving it a
-        comma-separated strengths value, e.g. "0.8,0.9,1.0").
+        Apply each enabled LoRA slot to the base model/clip and collect per-LoRA outputs.
         """
-        # Collect enabled lora rows, in the order the UI sent them (lora_1, lora_2, ...)
-        row_keys = [k for k in kwargs.keys() if k.lower().startswith("lora_") and isinstance(kwargs[k], dict)]
+        # Collect every enabled LoRA slot, in slot order, skipping disabled / unselected ones.
+        enabled_loras = []
+        for i in range(1, NUM_LORA_SLOTS + 1):
+            name = kwargs.get(f"lora_{i}", "None")
+            strength_raw = kwargs.get(f"strength_{i}", 1.0)
+            active = kwargs.get(f"on_{i}", True)
 
-        def _row_sort_key(k):
-            m = re.search(r'(\d+)$', k)
-            return int(m.group(1)) if m else 0
-
-        row_keys.sort(key=_row_sort_key)
-
-        rows = []  # list of (lora_name, [strength, ...])
-        for key in row_keys:
-            value = kwargs[key]
-            lora_name = value.get("lora")
-            is_on = value.get("on", True)
-            strengths_raw = value.get("strengths", value.get("strength", "1.0"))
-
-            if not is_on or not lora_name or lora_name == "None":
+            if not (active and name and name != "None"):
                 continue
 
-            strength_list = self._parse_strengths(strengths_raw)
-            if not strength_list:
-                print(f"[LoRAPlotNode] Warning: '{lora_name}' has no valid strength values, skipping.")
+            try:
+                strength = float(strength_raw)
+            except (TypeError, ValueError):
+                print(f"[LoRAPlotNode] Invalid strength for lora_{i} '{name}': {strength_raw!r}; skipping.")
                 continue
 
-            rows.append((lora_name, strength_list))
+            enabled_loras.append((i, name, strength))
 
-        if not rows:
-            raise ValueError("At least one enabled LoRA (with a valid strength) must be provided.")
+        if not enabled_loras:
+            raise ValueError(
+                "At least one LoRA must be enabled (on=True) with a valid selection. "
+                "Toggle on a LoRA slot and pick a file."
+            )
 
         models_output = []
         clips_output = []
@@ -95,8 +113,7 @@ class LoRAPlotNode:
         base_model = model
         base_clip = clip
 
-        # Iterate over each enabled LoRA row (outer loop)
-        for lora_name, strength_list in rows:
+        for slot_index, lora_name, strength in enabled_loras:
             # Validate LoRA file exists
             lora_path = folder_paths.get_full_path("loras", lora_name)
             if not lora_path or not os.path.exists(lora_path):
@@ -122,39 +139,27 @@ class LoRAPlotNode:
                         print(f"[LoRAPlotNode] Evicted '{oldest_key}' from cache (max size: {self._cache_max_size})")
                     self._lora_cache[lora_name] = lora_dict
 
-                # Cache sanitized filename (used for all strengths of this LoRA)
+                # Cache sanitized filename (used for metadata)
                 sanitized_lora = self._sanitize_filename(lora_name)
 
-                # Now iterate this row's own strengths using the already loaded dictionary
-                for strength in strength_list:
-                    try:
-                        # Apply LoRA to model and clip using the cached lora_dict
-                        model_lora, clip_lora = comfy.sd.load_lora_for_models(
-                            base_model, base_clip, lora_dict, strength, strength
-                        )
+                # Apply LoRA to model and clip using the cached lora_dict
+                model_lora, clip_lora = comfy.sd.load_lora_for_models(
+                    base_model, base_clip, lora_dict, strength, strength
+                )
 
-                        models_output.append(model_lora)
-                        clips_output.append(clip_lora)
+                models_output.append(model_lora)
+                clips_output.append(clip_lora)
 
-                        # Generate metadata string using cached sanitized name
-                        metadata = f"{sanitized_lora}_{strength}"
-                        metadata_output.append(metadata)
+                # Generate metadata string using the per-LoRA strength
+                metadata = f"{sanitized_lora}_{strength}"
+                metadata_output.append(metadata)
 
-                    except Exception as e_inner:
-                        # Collect error details for this strength
-                        error_msg = f"LoRA '{lora_name}' strength {strength}: {str(e_inner)}"
-                        error_messages.append(error_msg)
-                        print(f"[LoRAPlotNode] {error_msg}")
-                        print(f"[LoRAPlotNode] Traceback: {traceback.format_exc()}")
-                        # Continue with next strength
-                        continue
-
-                # MEMORY MANAGEMENT: Explicitly delete the heavy dictionary after all strengths are processed
+                # MEMORY MANAGEMENT: Explicitly delete the heavy dictionary after use
                 del lora_dict
 
-            except Exception as e_outer:
+            except Exception as e:
                 # Error loading the LoRA file itself
-                error_msg = f"Failed to load LoRA file '{lora_name}': {str(e_outer)}"
+                error_msg = f"Failed to load LoRA file '{lora_name}' (slot {slot_index}): {str(e)}"
                 error_messages.append(error_msg)
                 print(f"[LoRAPlotNode] {error_msg}")
                 print(f"[LoRAPlotNode] Traceback: {traceback.format_exc()}")
@@ -162,35 +167,19 @@ class LoRAPlotNode:
 
         # Ensure we have at least one successful combination
         if not models_output:
-            error_details = f"Rows: {rows}"
+            error_details = f"Selected LoRAs: {[n for _, n, _ in enabled_loras]}"
             if error_messages:
                 error_summary = "\n".join([f"  - {msg}" for msg in error_messages])
-                raise ValueError(f"No LoRA-strength combinations were successfully applied.\n\n{error_details}\n\nErrors:\n{error_summary}")
+                raise ValueError(
+                    f"No LoRA combinations were successfully applied.\n\n{error_details}\n\n"
+                    f"Errors:\n{error_summary}"
+                )
             else:
-                raise ValueError(f"No LoRA-strength combinations were successfully applied. {error_details}")
+                raise ValueError(
+                    f"No LoRA combinations were successfully applied. {error_details}"
+                )
 
         return (models_output, clips_output, metadata_output)
-
-    def _parse_strengths(self, strengths):
-        """
-        Parse a row's strength value, which may arrive as a float, an int, or a
-        (possibly comma-separated) string, into a list of floats.
-        """
-        if isinstance(strengths, (int, float)):
-            return [float(strengths)]
-        if isinstance(strengths, (list, tuple)):
-            out = []
-            for s in strengths:
-                try:
-                    out.append(float(s))
-                except (TypeError, ValueError):
-                    continue
-            return out
-        try:
-            return [float(s.strip()) for s in str(strengths).split(",") if s.strip()]
-        except ValueError:
-            print(f"[LoRAPlotNode] Warning: invalid strength value(s): {strengths!r}")
-            return []
 
     def _sanitize_filename(self, filename):
         """
@@ -341,33 +330,20 @@ class LoRAPlotImageSaver:
         
         return (output_images,)
     
-    # Candidate scalable font paths, in priority order, covering Linux, macOS and Windows.
-    _FONT_CANDIDATES = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",  # macOS
-        "/System/Library/Fonts/Helvetica.ttc",  # macOS
-        os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arialbd.ttf"),  # Windows
-        os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arial.ttf"),  # Windows
-    ]
-
     def _get_font(self, font_size):
         """
         Get font, caching by size to avoid reloading.
         """
         if font_size not in self._font_cache:
-            font = None
-            for font_path in self._FONT_CANDIDATES:
+            try:
+                # Try to use a nice font if available
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            except:
                 try:
-                    font = ImageFont.truetype(font_path, font_size)
-                    break
-                except Exception:
-                    continue
-            if font is None:
-                try:
-                    # Pillow >= 10.1 supports a size argument on the default font
-                    font = ImageFont.load_default(size=font_size)
-                except TypeError:
-                    # Older Pillow: default font is fixed-size and won't scale
+                    # Try another common font path
+                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+                except:
+                    # Fallback to default font
                     font = ImageFont.load_default()
             self._font_cache[font_size] = font
         return self._font_cache[font_size]
